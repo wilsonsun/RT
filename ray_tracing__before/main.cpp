@@ -38,6 +38,11 @@
 #include "nvvk/commands_vk.hpp"
 #include "nvvk/context_vk.hpp"
 
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>   // for glm::rotate
+#include <glm/gtc/quaternion.hpp>         // for glm::quat
+#include <glm/gtx/quaternion.hpp>         // for glm::quat(glm::radians(...))
+
 
 //////////////////////////////////////////////////////////////////////////
 #define UNUSED(x) (void)(x)
@@ -45,6 +50,19 @@
 
 // Default search path for shaders
 std::vector<std::string> defaultSearchPaths;
+
+// Forward declaration
+HelloVulkan * g_helloVk = nullptr;
+
+// GLFW keyboard callback
+void onKeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods)
+{
+	UNUSED(window);
+	if (g_helloVk)
+	{
+		g_helloVk->onKeyboard(key, scancode, action, mods);
+	}
+}
 
 
 // GLFW Callback functions
@@ -65,6 +83,26 @@ void renderUI(HelloVulkan& helloVk)
 
     ImGui::SliderFloat3("Position", &helloVk.m_pcRaster.lightPosition.x, -20.f, 20.f);
     ImGui::SliderFloat("Intensity", &helloVk.m_pcRaster.lightIntensity, 0.f, 150.f);
+	if (helloVk.m_pcRaster.lightType == 2)
+	{
+		static float lightRotation = 0.0f;
+		static glm::vec3 lightEuler = glm::vec3(0.0f);  // degrees
+		ImGui::SliderFloat3("Rotation (XYZ)", &lightEuler.x, -180.f, 180.f);
+
+		// Use quaternion to avoid gimbal lock
+		glm::quat q = glm::quat(glm::radians(lightEuler));
+		glm::mat3 rot = glm::mat3_cast(q);
+
+		// Base directions of the plane
+		glm::vec3 baseU = glm::vec3(1, 0, 0);
+		glm::vec3 baseV = glm::vec3(0, 0, 1);
+
+		glm::vec3 uRotated = rot * baseU;
+		glm::vec3 vRotated = rot * baseV;
+
+		helloVk.m_pcRaster.u = glm::vec4(uRotated, 0.0f);
+		helloVk.m_pcRaster.v = glm::vec4(vRotated, 0.0f);
+	}
   }
 }
 
@@ -94,7 +132,8 @@ int main(int argc, char** argv)
 
   // Setup camera
   CameraManip.setWindowSize(SAMPLE_WIDTH, SAMPLE_HEIGHT);
-  CameraManip.setLookat(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0, 0, 0), glm::vec3(0, 1, 0));
+  //CameraManip.setLookat(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0, 0, 0), glm::vec3(0, 1, 0));
+  CameraManip.setLookat(glm::vec3(4, 4, 4), glm::vec3(0, 1, 0), glm::vec3(0, 1, 0));
 
   // Setup Vulkan
   if(!glfwVulkanSupported())
@@ -127,6 +166,13 @@ int main(int argc, char** argv)
   contextInfo.addInstanceExtension(VK_EXT_DEBUG_UTILS_EXTENSION_NAME, true);  // Allow debug names
   contextInfo.addDeviceExtension(VK_KHR_SWAPCHAIN_EXTENSION_NAME);            // Enabling ability to present rendering
 
+  // Adding RT extensions
+  VkPhysicalDeviceAccelerationStructureFeaturesKHR accelFeature{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
+  contextInfo.addDeviceExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, false, &accelFeature);  // To build acceleration structures
+  VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipelineFeature{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR };
+  contextInfo.addDeviceExtension(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME, false, &rtPipelineFeature);  // To use vkCmdTraceRaysKHR
+  contextInfo.addDeviceExtension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);  // Required by ray tracing pipeline
+
   // Creating Vulkan base application
   nvvk::Context vkctx{};
   vkctx.initInstance(contextInfo);
@@ -138,6 +184,9 @@ int main(int argc, char** argv)
 
   // Create example
   HelloVulkan helloVk;
+  g_helloVk = &helloVk;
+
+  glfwSetKeyCallback(window, onKeyCallback);
 
   // Window need to be opened to get the surface on which to draw
   const VkSurfaceKHR surface = helloVk.getVkSurface(vkctx.m_instance, window);
@@ -153,7 +202,9 @@ int main(int argc, char** argv)
   helloVk.initGUI(0);  // Using sub-pass 0
 
   // Creation of the example
-  helloVk.loadModel(nvh::findFile("media/scenes/cube_multi.obj", defaultSearchPaths, true));
+  //helloVk.loadModel(nvh::findFile("media/scenes/cube_multi.obj", defaultSearchPaths, true));
+  helloVk.loadModel(nvh::findFile("media/scenes/Medieval_building.obj", defaultSearchPaths, true));
+  helloVk.loadModel(nvh::findFile("media/scenes/plane.obj", defaultSearchPaths, true));
 
   helloVk.createOffscreenRender();
   helloVk.createDescriptorSetLayout();
@@ -161,6 +212,14 @@ int main(int argc, char** argv)
   helloVk.createUniformBuffer();
   helloVk.createObjDescriptionBuffer();
   helloVk.updateDescriptorSet();
+  helloVk.initRayTracing();
+  bool useRaytracer = true;
+  helloVk.createBottomLevelAS();
+  helloVk.createTopLevelAS();
+  helloVk.createRtDescriptorSet();
+  helloVk.createDebugPipeline();
+  helloVk.createRtPipeline();
+  helloVk.createRtShaderBindingTable();
 
   helloVk.createPostDescriptor();
   helloVk.createPostPipeline();
@@ -187,6 +246,7 @@ int main(int argc, char** argv)
     {
       ImGuiH::Panel::Begin();
       ImGui::ColorEdit3("Clear color", reinterpret_cast<float*>(&clearColor));
+      ImGui::Checkbox("Ray Tracer mode", &useRaytracer); // Switch between raster and ray tracings
       renderUI(helloVk);
       ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
       ImGuiH::Control::Info("", "", "(F10) Toggle Pane", ImGuiH::Control::Flags::Disabled);
@@ -223,7 +283,18 @@ int main(int argc, char** argv)
 
       // Rendering Scene
       vkCmdBeginRenderPass(cmdBuf, &offscreenRenderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
-      helloVk.rasterize(cmdBuf);
+      //helloVk.rasterize(cmdBuf);
+	  // Rendering Scene
+      
+	  if (useRaytracer)
+	  {
+		  helloVk.raytrace(cmdBuf, clearColor);
+	  }
+	  else
+	  {
+		  helloVk.rasterize(cmdBuf);
+	  }
+      helloVk.drawLightDebug(cmdBuf);
       vkCmdEndRenderPass(cmdBuf);
     }
 

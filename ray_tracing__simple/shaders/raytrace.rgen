@@ -32,6 +32,10 @@ layout(location = 0) rayPayloadEXT hitPayload prd;
 layout(set = 0, binding = eTlas) uniform accelerationStructureEXT topLevelAS;
 layout(set = 0, binding = eOutImage, rgba32f) uniform image2D image;
 layout(set = 1, binding = eGlobals) uniform _GlobalUniforms { GlobalUniforms uni; };
+layout(set = 0, binding = eNormalImage, rgba16f) uniform image2D gNormal;
+layout(set = 0, binding = eLinearDepth, r32f) uniform image2D gDepth;
+layout(set = 0, binding = eMotionImage, rg16f) uniform image2D gMotion;
+layout(set = 0, binding = eNoisyShadow, r16f) uniform image2D gShadowNoisy;
 layout(push_constant) uniform _PushConstantRay { PushConstantRay pcRay; };
 // clang-format on
 
@@ -48,7 +52,14 @@ void main()
 
   uint  rayFlags = gl_RayFlagsOpaqueEXT;
   float tMin     = 0.001;
-  float tMax     = 10000.0;
+  float tMax     = 100.0;
+
+  // Preclear
+  const float FAR_T = 100.0;          // match your tMax
+  imageStore(gNormal, ivec2(gl_LaunchIDEXT.xy), vec4(0.0, 0.0, 0.0, 1.0)); // default for miss
+  imageStore(gDepth, ivec2(gl_LaunchIDEXT.xy), vec4(FAR_T,0,0,0));
+  imageStore(gMotion, ivec2(gl_LaunchIDEXT.xy), vec4(0.0, 0.0, 0.0, 0.0));
+  imageStore(gShadowNoisy, ivec2(gl_LaunchIDEXT.xy), vec4(1.0, 1.0, 1.0, 1.0));
 
   traceRayEXT(topLevelAS,     // acceleration structure
               rayFlags,       // rayFlags

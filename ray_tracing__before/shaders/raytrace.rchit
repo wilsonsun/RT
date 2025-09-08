@@ -19,14 +19,9 @@ layout(buffer_reference, scalar) buffer MatIndices { int    i[];          };
 
 layout(set = 0, binding = eTlas) uniform accelerationStructureEXT topLevelAS;
 
-layout(set = 0, binding = eNormalImage, rgba16f) uniform image2D gNormal;
-layout(set = 0, binding = eLinearDepth, r32f) uniform image2D gDepth;
-layout(set = 0, binding = eMotionImage, rg16f) uniform image2D gMotion;
-layout(set = 0, binding = eNoisyShadow, r16f) uniform image2D gShadowNoisy;
-
 layout(set = 1, binding = eObjDescs, scalar) buffer ObjDesc_ { ObjDesc i[]; } objDesc;
 layout(set = 1, binding = eTextures) uniform sampler2D textureSamplers[];
-layout(set = 1, binding = eGlobals) uniform _GlobalUniforms { GlobalUniforms uni; };
+
 layout(push_constant) uniform _PushConstantRay { PushConstantRay pcRay; };
 
 hitAttributeEXT vec3 attribs;
@@ -113,41 +108,6 @@ void main() {
   int                 matIdx = matIndices.i[gl_PrimitiveID];
   WaveFrontMaterial   mat    = materials.m[matIdx];
 
-  // Store World Normal
-  vec3 V = normalize(-gl_WorldRayDirectionEXT); // view (from hit point toward camera) 
-  vec3 Nf = normalize(faceforward(N, -V, N)); // make it consistently oriented 
-  // Write raw [-1,1] in RGBA16F (good for ML/denoisers); or encode to [0,1] if you prefer to visualize. 
-  imageStore(gNormal, ivec2(gl_LaunchIDEXT.xy), vec4(Nf, 1.0));
-
-  // Store Linear Depth
-  float d = gl_HitTEXT * length(gl_WorldRayDirectionEXT);                      // <- valid here, if ray dir is unit
-
-  // closest-hit.glsl
-  vec3 X = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT; // world hit
-  vec3 camPos  = (uni.viewInverse * vec4(0,0,0,1)).xyz;
-  vec3 camFwd  = normalize(-mat3(uni.viewInverse)[2]);  // camera forward (-Z row of viewInverse)
-  float z_view = dot(X - camPos, camFwd);               // positive forward distance
-  imageStore(gDepth, ivec2(gl_LaunchIDEXT.xy), vec4(z_view,0,0,0));
-  //imageStore(gDepth, ivec2(gl_LaunchIDEXT.xy), vec4(d,0,0,0));
-
-  // Motion vectors (pixels). viewProj == VP_curr per our UBO plan.
-  vec4 c_curr = uni.viewProj * vec4(X, 1.0);
-  vec4 c_prev = uni.VP_prev  * vec4(X, 1.0);
-
-  // Guard against invalid projections (behind camera etc.)
-  bool ok_curr = abs(c_curr.w) > 1e-6;
-  bool ok_prev = abs(c_prev.w) > 1e-6;
-
-  vec2 motion_px = vec2(0.0);
-  if (ok_curr && ok_prev) {
-      vec2 ndc_curr = c_curr.xy / c_curr.w;   // [-1,1]
-      vec2 ndc_prev = c_prev.xy / c_prev.w;
-      motion_px = 0.5 * (ndc_curr - ndc_prev) * uni.viewportSize; // pixels
-  }
-
-  // Write motion (RG). You can pack to half; sign is fine.
-  imageStore(gMotion, ivec2(gl_LaunchIDEXT.xy), vec4(motion_px, 0.0, 0.0)); 
-
   // Optional texture
   vec3 albedoTex = vec3(1.0);
   if (mat.textureId >= 0) {
@@ -176,9 +136,8 @@ void main() {
     distMax     = INF;
     lightI      = pcRay.lightIntensity;
   } else { // pcRay.lightType == 2  (rectangle area light)
-    const int   NUM_SAMPLES = 1;
+    const int   NUM_SAMPLES = 10;
     vec3        accum       = vec3(0.0);
-    int unoccluded = 0;
 
     // Precompute view dir for specular (keep your convention)
     vec3 V = gl_WorldRayDirectionEXT;
@@ -197,16 +156,12 @@ void main() {
 
       bool blocked = traceShadowAnyHit(P + N * EPS, Ls, d - EPS);
       float shadow = blocked ? 0.0001 : 1.0;
-      unoccluded += blocked ? 0 : 1;
 
       vec3  diff = computeDiffuse(mat, Ls, N) * albedoTex;
       vec3  spec = blocked ? vec3(0.0) : computeSpecular(mat, V, Ls, N);
 
       accum += shadow * I * (diff + spec);
     }
-
-    float visibility = float(unoccluded) / float(NUM_SAMPLES);
-    imageStore(gShadowNoisy, ivec2(gl_LaunchIDEXT.xy), vec4(visibility,0,0,0));
 
     prd.hitValue = accum / float(NUM_SAMPLES);
     return;
@@ -215,7 +170,6 @@ void main() {
   // Point/Directional path
   // Only consider if light is on the front side
   vec3 color = vec3(0.0);
-  float visibility = 0.0;
   if (dot(N, L) > 0.0) {
     bool blocked = traceShadowAnyHit(P + N * EPS, L, distMax - EPS);
     float shadow = blocked ? 0.0001 : 1.0;
@@ -224,9 +178,7 @@ void main() {
     vec3 spec = blocked ? vec3(0.0) : computeSpecular(mat, gl_WorldRayDirectionEXT, L, N);
 
     color = lightI * shadow * (diff + spec);
-    visibility = blocked ? 0.0 : 1.0;
   }
-  imageStore(gShadowNoisy, ivec2(gl_LaunchIDEXT.xy), vec4(visibility,0,0,0));
 
   prd.hitValue = color;
 }

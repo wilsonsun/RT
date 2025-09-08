@@ -1,0 +1,67 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : enable
+#extension GL_EXT_nonuniform_qualifier         : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+layout (local_size_x = 8, local_size_y = 8) in;
+
+layout (set=0, binding=0) uniform sampler2D   tMeanVar;   // R16G16: (mean, var)
+layout (set=0, binding=1) uniform sampler2D   tNormal;    // RGBA16F world normal
+layout (set=0, binding=2) uniform sampler2D   tDepth;     // R32F linear depth
+layout (set=0, binding=3, r16f) uniform image2D imgOut;   // denoised
+
+layout(push_constant) uniform PC {
+  float invSigmaZ;      // depth edge strength (bigger => tighter)
+  float invSigmaN;      // normal edge strength (cos^invSigmaN)
+  float varToRadius;    // variance -> radius scale
+  float varClamp;       // cap variance influence
+} pc;
+
+float luminance(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); } // optional
+
+void main()
+{
+  ivec2 p  = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 sz = imageSize(imgOut);
+  if(any(greaterThanEqual(p, sz))) return;
+
+  vec2  uv   = (vec2(p) + 0.5) / vec2(sz);
+  vec2  mv   = texture(tMeanVar, uv).xy;   // (mean, var)
+  float mean0= mv.x;
+  float var0 = clamp(mv.y, 0.0, pc.varClamp);
+
+  vec3  n0   = normalize(texture(tNormal, uv).xyz * 2.0 - 1.0); // if stored [-1,1]
+  float z0   = texture(tDepth, uv).x;
+
+  // variance -> radius: e.g., r in [1 .. 5]
+  float rF   = 1.0 + pc.varToRadius * var0;   // map var to a soft radius
+  int   R    = int(clamp(floor(rF), 1.0, 5.0));
+
+  float S=0.0, W=0.0;
+
+  // simple 5x5 Manhattan kernel weights (or use a small Gaussian)
+  // Here we compute weights on the fly; you can pre-table if you like
+  for(int dy=-R; dy<=R; ++dy)
+  for(int dx=-R; dx<=R; ++dx)
+  {
+    ivec2 q = clamp(p + ivec2(dx,dy), ivec2(0), sz-ivec2(1));
+    vec2  uvq = (vec2(q)+0.5)/vec2(sz);
+
+    vec2  mvq = texture(tMeanVar, uvq).xy;
+    float meanq = mvq.x;
+
+    vec3  nq = normalize(texture(tNormal, uvq).xyz * 2.0 - 1.0);
+    float zq = texture(tDepth,  uvq).x;
+
+    float wK = 1.0;                           // box (replace with separable if you want)
+    float wN = pow(max(dot(n0, nq), 0.0), pc.invSigmaN);
+    float wZ = exp(-abs(z0 - zq) * pc.invSigmaZ);
+    float w  = wK * wN * wZ;
+
+    S += w * meanq;
+    W += w;
+  }
+
+  float outv = (W > 1e-6) ? (S / W) : mean0;
+  imageStore(imgOut, p, vec4(outv, 0,0,0));
+}

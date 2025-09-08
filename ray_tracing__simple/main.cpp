@@ -38,10 +38,18 @@
 #include "nvvk/commands_vk.hpp"
 #include "nvvk/context_vk.hpp"
 
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>   // for glm::rotate
+#include <glm/gtc/quaternion.hpp>         // for glm::quat
+#include <glm/gtx/quaternion.hpp>         // for glm::quat(glm::radians(...))
+
 
 //////////////////////////////////////////////////////////////////////////
 #define UNUSED(x) (void)(x)
 //////////////////////////////////////////////////////////////////////////
+
+// Forward declaration
+HelloVulkan* g_helloVk = nullptr;
 
 // Default search path for shaders
 std::vector<std::string> defaultSearchPaths;
@@ -53,6 +61,16 @@ static void onErrorCallback(int error, const char* description)
   fprintf(stderr, "GLFW Error %d: %s\n", error, description);
 }
 
+// GLFW keyboard callback
+void onKeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods)
+{
+	UNUSED(window);
+	if (g_helloVk)
+	{
+		g_helloVk->onKeyboard(key, scancode, action, mods);
+	}
+}
+
 // Extra UI
 void renderUI(HelloVulkan& helloVk)
 {
@@ -62,10 +80,52 @@ void renderUI(HelloVulkan& helloVk)
     ImGui::RadioButton("Point", &helloVk.m_pcRaster.lightType, 0);
     ImGui::SameLine();
     ImGui::RadioButton("Infinite", &helloVk.m_pcRaster.lightType, 1);
+	ImGui::SameLine();
+	ImGui::RadioButton("Rect Light", &helloVk.m_pcRaster.lightType, 2);
+
+	ImGui::RadioButton("Color", &helloVk.m_postPC.mode, 0);
+	ImGui::SameLine();
+	ImGui::RadioButton("Normal", &helloVk.m_postPC.mode, 1);
+	ImGui::SameLine();
+	ImGui::RadioButton("Depth", &helloVk.m_postPC.mode, 2);
+	ImGui::SameLine();
+	ImGui::RadioButton("Motion Vector", &helloVk.m_postPC.mode, 3);
+
+	ImGui::RadioButton("Noisy shadow", &helloVk.m_postPC.mode, 4);
+    ImGui::SameLine();
+	ImGui::RadioButton("Denoised shadow", &helloVk.m_postPC.mode, 5); 
 
     ImGui::SliderFloat3("Position", &helloVk.m_pcRaster.lightPosition.x, -20.f, 20.f);
     ImGui::SliderFloat("Intensity", &helloVk.m_pcRaster.lightIntensity, 0.f, 150.f);
   }
+  if (helloVk.m_pcRaster.lightType == 2)
+  {
+	  static float lightRotation = 0.0f;
+	  static glm::vec3 lightEuler = glm::vec3(0.0f);  // degrees
+	  ImGui::SliderFloat3("Rotation (XYZ)", &lightEuler.x, -180.f, 180.f);
+
+	  // Use quaternion to avoid gimbal lock
+	  glm::quat q = glm::quat(glm::radians(lightEuler));
+	  glm::mat3 rot = glm::mat3_cast(q);
+
+	  // Base directions of the plane
+	  glm::vec3 baseU = glm::vec3(1, 0, 0);
+	  glm::vec3 baseV = glm::vec3(0, 0, 1);
+
+	  glm::vec3 uRotated = rot * baseU;
+	  glm::vec3 vRotated = rot * baseV;
+
+	  helloVk.m_pcRaster.u = glm::vec4(uRotated, 0.0f);
+	  helloVk.m_pcRaster.v = glm::vec4(vRotated, 0.0f);
+  }
+
+  if (ImGui::CollapsingHeader("Shadow Denoiser")) {
+	  ImGui::SliderFloat("Inv Sigma Z", &helloVk.m_spatialPC.invSigmaZ, 1.0f, 200.0f, "%.1f");
+	  ImGui::SliderFloat("Inv Sigma N", &helloVk.m_spatialPC.invSigmaN, 1.0f, 128.0f, "%.1f");
+	  ImGui::SliderFloat("Var -> Radius", &helloVk.m_spatialPC.varToRadius, 0.0f, 20.0f, "%.2f");
+	  ImGui::SliderFloat("Var Clamp", &helloVk.m_spatialPC.varClamp, 0.0f, 1.0f, "%.2f");
+  }
+
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -145,6 +205,9 @@ int main(int argc, char** argv)
 
   // Create example
   HelloVulkan helloVk;
+  g_helloVk = &helloVk;
+
+  glfwSetKeyCallback(window, onKeyCallback);
 
   // Window need to be opened to get the surface on which to draw
   const VkSurfaceKHR surface = helloVk.getVkSurface(vkctx.m_instance, window);
@@ -155,6 +218,7 @@ int main(int argc, char** argv)
   helloVk.createDepthBuffer();
   helloVk.createRenderPass();
   helloVk.createFrameBuffers();
+  helloVk.m_framesInFlight = static_cast<uint32_t>(helloVk.getFramebuffers().size());
 
   // Setup Imgui
   helloVk.initGUI(0);  // Using sub-pass 0
@@ -177,6 +241,14 @@ int main(int argc, char** argv)
   helloVk.createRtDescriptorSet();
   helloVk.createRtPipeline();
   helloVk.createRtShaderBindingTable();
+
+  // Pass 1 init
+  helloVk.createTemporalDescriptor();
+  helloVk.createTemporalPipeline();
+
+  // Pass 2 init
+  helloVk.createSpatialDescriptor();
+  helloVk.createSpatialPipeline();
 
   helloVk.createPostDescriptor();
   helloVk.createPostPipeline();
@@ -247,6 +319,8 @@ int main(int argc, char** argv)
       if(useRaytracer)
       {
         helloVk.raytrace(cmdBuf, clearColor);
+        helloVk.runTemporalPass1(cmdBuf, curFrame);
+        helloVk.runSpatialPass2(cmdBuf, helloVk.m_histIdx, curFrame);
       }
       else
       {

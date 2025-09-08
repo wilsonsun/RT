@@ -47,8 +47,12 @@ START_BINDING(SceneBindings)
 END_BINDING();
 
 START_BINDING(RtxBindings)
-  eTlas     = 0,  // Top-level acceleration structure
-  eOutImage = 1   // Ray tracer output image
+eTlas = 0,   // Top-level acceleration structure
+eOutImage = 1,   // Ray tracer output image
+eNormalImage = 2, // Ray tracer world normal output image 
+eLinearDepth = 3,
+eMotionImage = 4,
+eNoisyShadow = 5
 END_BINDING();
 // clang-format on
 
@@ -67,8 +71,16 @@ struct ObjDesc
 struct GlobalUniforms
 {
   mat4 viewProj;     // Camera view * projection
+
+  mat4 VP_prev;       // last frame's P*V (with last frame's jitter if any)
+  mat4 V_curr;        // optional but handy
+  mat4 P_curr;        // optional but handy
+
   mat4 viewInverse;  // Camera inverse view matrix
   mat4 projInverse;  // Camera inverse projection matrix
+
+  vec2 viewportSize;  // (w, h) in pixels
+  vec2 _pad;          // keep 16B alignment
 };
 
 // Push constant structure for the raster
@@ -79,16 +91,28 @@ struct PushConstantRaster
   uint  objIndex;
   float lightIntensity;
   int   lightType;
+  // Rectangle Lights
+  vec4  u;              // U vector of rectangle
+  vec4  v;              // V vector of rectangle
+  float area;           // Area of rectangle
+  vec3  _pad1;          // 12 bytes (pad to 16-byte multiple)
 };
-
 
 // Push constant structure for the ray tracer
 struct PushConstantRay
 {
-  vec4  clearColor;
-  vec3  lightPosition;
-  float lightIntensity;
-  int   lightType;
+  vec4  clearColor;      // 16 bytes (offset 0)
+  
+  vec3  lightPosition;   // 12 bytes (offset 16)
+  float lightIntensity;  // 4 bytes (offset 28) completes 16 bytes block
+  
+  int   lightType;       // 4 bytes (offset 32)
+  float lightArea;       // 4 bytes (offset 36)
+  // Add 8 bytes padding here to align next vec4 to 16 bytes
+  int   _pad1[2];        // 8 bytes padding (offset 40)
+  
+  vec4  lightU;          // 16 bytes (offset 48)
+  vec4  lightV;          // 16 bytes (offset 64)
 };
 
 struct Vertex  // See ObjLoader, copy of VertexObj, could be compressed for device

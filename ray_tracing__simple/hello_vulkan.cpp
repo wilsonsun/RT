@@ -56,6 +56,10 @@ void HelloVulkan::setup(const VkInstance& instance, const VkDevice& device, cons
 //
 void HelloVulkan::updateUniformBuffer(const VkCommandBuffer& cmdBuf)
 {
+  CameraManip.updateAnim();
+  CameraManip.setAnimationDuration(0.0);  // makes it instant
+  CameraManip.setSpeed(100.0f);            // try 50 or higher
+
   // Prepare new UBO contents on host.
   const float    aspectRatio = m_size.width / static_cast<float>(m_size.height);
   GlobalUniforms hostUBO     = {};
@@ -63,9 +67,28 @@ void HelloVulkan::updateUniformBuffer(const VkCommandBuffer& cmdBuf)
   glm::mat4      proj        = glm::perspectiveRH_ZO(glm::radians(CameraManip.getFov()), aspectRatio, 0.1f, 1000.0f);
   proj[1][1] *= -1;  // Inverting Y for Vulkan (not needed with perspectiveVK).
 
+  if (m_firstFrame) {
+	  m_prevV = view;
+	  m_prevP = proj;
+	  m_prevVP = proj * view;
+	  m_firstFrame = false;
+  }
+  else {
+	  m_prevV = m_currV;
+	  m_prevP = m_currP;
+	  m_prevVP = m_currVP;
+  }
+  m_currV = view;
+  m_currP = proj;
+  m_currVP = proj * view;
+
+  hostUBO.VP_prev = m_prevVP;
+  hostUBO.V_curr = m_currV;
+  hostUBO.P_curr = m_currP;
   hostUBO.viewProj    = proj * view;
   hostUBO.viewInverse = glm::inverse(view);
   hostUBO.projInverse = glm::inverse(proj);
+  hostUBO.viewportSize = glm::vec2(float(m_size.width), float(m_size.height));
 
   // UBO on the device, and what stages access it.
   VkBuffer deviceUBO      = m_bGlobals.buffer;
@@ -106,7 +129,7 @@ void HelloVulkan::createDescriptorSetLayout()
 
   // Camera matrices
   m_descSetLayoutBind.addBinding(SceneBindings::eGlobals, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
-                                 VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR);
+                                 VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
   // Obj descriptions
   m_descSetLayoutBind.addBinding(SceneBindings::eObjDescs, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                                  VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
@@ -355,6 +378,16 @@ void HelloVulkan::destroyResources()
   vkDestroyDescriptorPool(m_device, m_descPool, nullptr);
   vkDestroyDescriptorSetLayout(m_device, m_descSetLayout, nullptr);
 
+  vkDestroyPipeline(m_device, m_temporalPipeline, nullptr);
+  vkDestroyPipelineLayout(m_device, m_temporalPipeLayout, nullptr);
+  vkDestroyDescriptorPool(m_device, m_temporalDescPool, nullptr);
+  vkDestroyDescriptorSetLayout(m_device, m_temporalDescSetLayout, nullptr);
+
+  vkDestroyPipeline(m_device, m_spatialPipeline, nullptr);
+  vkDestroyPipelineLayout(m_device, m_spatialPipeLayout, nullptr);
+  vkDestroyDescriptorPool(m_device, m_spatialDescPool, nullptr);
+  vkDestroyDescriptorSetLayout(m_device, m_spatialDescSetLayout, nullptr);
+
   m_alloc.destroy(m_bGlobals);
   m_alloc.destroy(m_bObjDesc);
 
@@ -372,8 +405,19 @@ void HelloVulkan::destroyResources()
   }
 
   //#Post
+  m_alloc.destroy(m_offscreenNoisyShadow);
   m_alloc.destroy(m_offscreenColor);
+  m_alloc.destroy(m_offscreenNormal);
   m_alloc.destroy(m_offscreenDepth);
+  m_alloc.destroy(m_offscreenLinearDepth);
+  m_alloc.destroy(m_offscreenMotion);
+  m_alloc.destroy(m_prevNormal);
+  m_alloc.destroy(m_prevDepth);
+  m_alloc.destroy(m_denoisedShadow);
+
+  // if you created history images
+  for (int i = 0; i < 2; i++)
+	  m_alloc.destroy(m_histMoments[i]);
   vkDestroyPipeline(m_device, m_postPipeline, nullptr);
   vkDestroyPipelineLayout(m_device, m_postPipelineLayout, nullptr);
   vkDestroyDescriptorPool(m_device, m_postDescPool, nullptr);
@@ -433,8 +477,8 @@ void HelloVulkan::onResize(int /*w*/, int /*h*/)
   createOffscreenRender();
   updatePostDescriptorSet();
   updateRtDescriptorSet();
+  m_firstFrame = true;  // <-- ensure VP_prev == VP_curr next frame (no bogus motion)
 }
-
 
 //////////////////////////////////////////////////////////////////////////
 // Post-processing
@@ -446,8 +490,17 @@ void HelloVulkan::onResize(int /*w*/, int /*h*/)
 //
 void HelloVulkan::createOffscreenRender()
 {
-  m_alloc.destroy(m_offscreenColor);
-  m_alloc.destroy(m_offscreenDepth);
+	m_alloc.destroy(m_offscreenColor);
+	m_alloc.destroy(m_offscreenDepth);
+    m_alloc.destroy(m_offscreenNormal);
+    m_alloc.destroy(m_offscreenLinearDepth);
+    m_alloc.destroy(m_offscreenMotion);
+	m_alloc.destroy(m_prevNormal);
+	m_alloc.destroy(m_prevDepth);
+
+	// if you created history images
+	for (int i = 0; i < 2; i++)
+		m_alloc.destroy(m_histMoments[i]);
 
   // Creating the color image
   {
@@ -461,6 +514,31 @@ void HelloVulkan::createOffscreenRender()
     VkSamplerCreateInfo   sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     m_offscreenColor                        = m_alloc.createTexture(image, ivInfo, sampler);
     m_offscreenColor.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  }
+
+  // Noisy shadow (scalar visibility) image
+  {
+	  auto ci = nvvk::makeImage2DCreateInfo(
+		  m_size, m_offscreenNoisyShadowFormat,
+		  VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+
+	  nvvk::Image img = m_alloc.createImage(ci);
+	  VkImageViewCreateInfo iv = nvvk::makeImageViewCreateInfo(img.image, ci);
+	  VkSamplerCreateInfo   sp{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+	  m_offscreenNoisyShadow = m_alloc.createTexture(img, iv, sp);
+	  m_offscreenNoisyShadow.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  }
+
+  // Create normal image
+  {
+	  auto normalCreateInfo = nvvk::makeImage2DCreateInfo(m_size, m_offscreenNormalFormat,
+		                                                  VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+
+	  nvvk::Image image = m_alloc.createImage(normalCreateInfo);
+	  VkImageViewCreateInfo ivInfo = nvvk::makeImageViewCreateInfo(image.image, normalCreateInfo);
+	  VkSamplerCreateInfo sampler{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+	  m_offscreenNormal = m_alloc.createTexture(image, ivInfo, sampler);
+	  m_offscreenNormal.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
   }
 
   // Creating the depth buffer
@@ -477,14 +555,112 @@ void HelloVulkan::createOffscreenRender()
 
     m_offscreenDepth = m_alloc.createTexture(image, depthStencilView);
   }
+  
+  // Create the linear depth buffer for RT
+  {
+	  auto linearDepthCreateInfo = nvvk::makeImage2DCreateInfo(m_size, m_offscreenLinearDepthFormat,
+		                                                       VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+
+	  nvvk::Image image = m_alloc.createImage(linearDepthCreateInfo);
+	  VkImageViewCreateInfo ivInfo = nvvk::makeImageViewCreateInfo(image.image, linearDepthCreateInfo);
+	  VkSamplerCreateInfo sampler{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+	  m_offscreenLinearDepth = m_alloc.createTexture(image, ivInfo, sampler);
+      m_offscreenLinearDepth.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  }
+
+  // Motion vector for RT
+  {
+	  auto motionCreateInfo = nvvk::makeImage2DCreateInfo(
+		  m_size, m_offscreenMotionFormat,
+		  VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+
+	  nvvk::Image image = m_alloc.createImage(motionCreateInfo);
+	  VkImageViewCreateInfo ivInfo = nvvk::makeImageViewCreateInfo(image.image, motionCreateInfo);
+	  VkSamplerCreateInfo sampler{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+	  m_offscreenMotion = m_alloc.createTexture(image, ivInfo, sampler);
+	  m_offscreenMotion.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  }
+
+  // Moment images
+  {
+      auto momentsCI = nvvk::makeImage2DCreateInfo(
+	      m_size, VK_FORMAT_R16G16_SFLOAT,
+	      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+
+      for (int i = 0; i < 2; i++) {
+          nvvk::Image img = m_alloc.createImage(momentsCI);
+          VkImageViewCreateInfo iv = nvvk::makeImageViewCreateInfo(img.image, momentsCI);
+          VkSamplerCreateInfo   sp{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+          m_histMoments[i] = m_alloc.createTexture(img, iv, sp);
+          m_histMoments[i].descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      }
+  }
+
+   // Prev Normal (to store last frame's normal buffer)
+   {
+   	    auto ci = nvvk::makeImage2DCreateInfo(
+   		    m_size,
+   		    m_offscreenNormalFormat,  // e.g. VK_FORMAT_R16G16B16A16_SFLOAT
+   		    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+   
+   	    nvvk::Image img = m_alloc.createImage(ci);
+   	    VkImageViewCreateInfo iv = nvvk::makeImageViewCreateInfo(img.image, ci);
+   	    VkSamplerCreateInfo sp{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+   	    m_prevNormal = m_alloc.createTexture(img, iv, sp);
+   	    m_prevNormal.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+   }
+   
+   // Prev Depth (to store last frame's linear depth buffer)
+   {
+   	    auto ci = nvvk::makeImage2DCreateInfo(
+   		    m_size,
+   		    m_offscreenLinearDepthFormat,  // e.g. VK_FORMAT_R32_SFLOAT
+   		    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+   
+   	    nvvk::Image img = m_alloc.createImage(ci);
+   	    VkImageViewCreateInfo iv = nvvk::makeImageViewCreateInfo(img.image, ci);
+   	    VkSamplerCreateInfo sp{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+   	    m_prevDepth = m_alloc.createTexture(img, iv, sp);
+   	    m_prevDepth.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+   }
+
+   // During createOffscreenRender()
+   {
+	   auto ci = nvvk::makeImage2DCreateInfo(m_size, VK_FORMAT_R16_SFLOAT,
+		   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+	   nvvk::Image img = m_alloc.createImage(ci);
+	   VkImageViewCreateInfo iv = nvvk::makeImageViewCreateInfo(img.image, ci);
+	   VkSamplerCreateInfo sp{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+	   m_denoisedShadow = m_alloc.createTexture(img, iv, sp);
+	   m_denoisedShadow.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+
+   }
 
   // Setting the image layout for both color and depth
   {
     nvvk::CommandPool genCmdBuf(m_device, m_graphicsQueueIndex);
     auto              cmdBuf = genCmdBuf.createCommandBuffer();
+	nvvk::cmdBarrierImageLayout(cmdBuf, m_offscreenNoisyShadow.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     nvvk::cmdBarrierImageLayout(cmdBuf, m_offscreenColor.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+	nvvk::cmdBarrierImageLayout(cmdBuf, m_offscreenNormal.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    nvvk::cmdBarrierImageLayout(cmdBuf, m_offscreenLinearDepth.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     nvvk::cmdBarrierImageLayout(cmdBuf, m_offscreenDepth.image, VK_IMAGE_LAYOUT_UNDEFINED,
                                 VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+	nvvk::cmdBarrierImageLayout(cmdBuf, m_offscreenMotion.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+
+	for (int i = 0; i < 2; ++i) {
+		nvvk::cmdBarrierImageLayout(cmdBuf, m_histMoments[i].image,
+			VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+	}
+
+	// init layout
+	nvvk::cmdBarrierImageLayout(cmdBuf, m_denoisedShadow.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+
+	nvvk::cmdBarrierImageLayout(cmdBuf, m_prevNormal.image,
+		VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+	nvvk::cmdBarrierImageLayout(cmdBuf, m_prevDepth.image,
+		VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
 
     genCmdBuf.submitAndWait(cmdBuf);
   }
@@ -517,14 +693,15 @@ void HelloVulkan::createOffscreenRender()
 void HelloVulkan::createPostPipeline()
 {
   // Push constants in the fragment shader
-  VkPushConstantRange pushConstantRanges = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float)};
+  //VkPushConstantRange pushConstantRanges = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float)};
+  VkPushConstantRange pcRange{ VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PostPC) };
 
   // Creating the pipeline layout
   VkPipelineLayoutCreateInfo createInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
   createInfo.setLayoutCount         = 1;
   createInfo.pSetLayouts            = &m_postDescSetLayout;
   createInfo.pushConstantRangeCount = 1;
-  createInfo.pPushConstantRanges    = &pushConstantRanges;
+  createInfo.pPushConstantRanges    = &pcRange;
   vkCreatePipelineLayout(m_device, &createInfo, nullptr, &m_postPipelineLayout);
 
 
@@ -543,7 +720,13 @@ void HelloVulkan::createPostPipeline()
 //
 void HelloVulkan::createPostDescriptor()
 {
-  m_postDescSetLayoutBind.addBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
+  m_postDescSetLayoutBind.addBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT); // color
+  m_postDescSetLayoutBind.addBinding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT); // normal
+  m_postDescSetLayoutBind.addBinding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT); // linear depth
+  m_postDescSetLayoutBind.addBinding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT); // motion
+  m_postDescSetLayoutBind.addBinding(4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT); // noisy shadow  <-- NEW
+  m_postDescSetLayoutBind.addBinding(5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT); // denoised     <-- NEW
+
   m_postDescSetLayout = m_postDescSetLayoutBind.createLayout(m_device);
   m_postDescPool      = m_postDescSetLayoutBind.createPool(m_device);
   m_postDescSet       = nvvk::allocateDescriptorSet(m_device, m_postDescPool, m_postDescSetLayout);
@@ -555,8 +738,15 @@ void HelloVulkan::createPostDescriptor()
 //
 void HelloVulkan::updatePostDescriptorSet()
 {
-  VkWriteDescriptorSet writeDescriptorSets = m_postDescSetLayoutBind.makeWrite(m_postDescSet, 0, &m_offscreenColor.descriptor);
-  vkUpdateDescriptorSets(m_device, 1, &writeDescriptorSets, 0, nullptr);
+  VkWriteDescriptorSet writes[6] = {
+    m_postDescSetLayoutBind.makeWrite(m_postDescSet, 0, &m_offscreenColor.descriptor),
+    m_postDescSetLayoutBind.makeWrite(m_postDescSet, 1, &m_offscreenNormal.descriptor),
+    m_postDescSetLayoutBind.makeWrite(m_postDescSet, 2, &m_offscreenLinearDepth.descriptor),
+    m_postDescSetLayoutBind.makeWrite(m_postDescSet, 3, &m_offscreenMotion.descriptor),
+	m_postDescSetLayoutBind.makeWrite(m_postDescSet, 4, &m_offscreenNoisyShadow.descriptor), // NEW
+    m_postDescSetLayoutBind.makeWrite(m_postDescSet, 5, &m_denoisedShadow.descriptor)        // NEW (optional)
+  };
+  vkUpdateDescriptorSets(m_device, 6, writes, 0, nullptr);
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -568,10 +758,15 @@ void HelloVulkan::drawPost(VkCommandBuffer cmdBuf)
 
   setViewport(cmdBuf);
 
-  auto aspectRatio = static_cast<float>(m_size.width) / static_cast<float>(m_size.height);
-  vkCmdPushConstants(cmdBuf, m_postPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float), &aspectRatio);
+  m_postPC.aspect = static_cast<float>(m_size.width) / static_cast<float>(m_size.height);
+  //m_postPC.mode = 3; // 0 = color, 1 = normals, 2 = depth (or whatever you choose), 3 motion
+
+  vkCmdPushConstants(cmdBuf, m_postPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
+	  0, sizeof(PostPC), &m_postPC);
+
   vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_postPipeline);
-  vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_postPipelineLayout, 0, 1, &m_postDescSet, 0, nullptr);
+  vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_postPipelineLayout,
+	  0, 1, &m_postDescSet, 0, nullptr);
   vkCmdDraw(cmdBuf, 3, 1, 0, 0);
 
   m_debug.endLabel(cmdBuf);
@@ -688,6 +883,18 @@ void HelloVulkan::createRtDescriptorSet()
   m_rtDescSetLayoutBind.addBinding(RtxBindings::eOutImage, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
                                    VK_SHADER_STAGE_RAYGEN_BIT_KHR);  // Output image
 
+  m_rtDescSetLayoutBind.addBinding(RtxBindings::eNormalImage, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
+	                               VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR); // Output world normal
+
+  m_rtDescSetLayoutBind.addBinding(RtxBindings::eLinearDepth, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
+	                               VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR); // Output linear Depth
+
+  m_rtDescSetLayoutBind.addBinding(RtxBindings::eMotionImage, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
+	                               VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
+
+  m_rtDescSetLayoutBind.addBinding(RtxBindings::eNoisyShadow, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
+								   VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR);
+
   m_rtDescPool      = m_rtDescSetLayoutBind.createPool(m_device);
   m_rtDescSetLayout = m_rtDescSetLayoutBind.createLayout(m_device);
 
@@ -703,10 +910,19 @@ void HelloVulkan::createRtDescriptorSet()
   descASInfo.accelerationStructureCount = 1;
   descASInfo.pAccelerationStructures    = &tlas;
   VkDescriptorImageInfo imageInfo{{}, m_offscreenColor.descriptor.imageView, VK_IMAGE_LAYOUT_GENERAL};
+  VkDescriptorImageInfo normalInfo{{}, m_offscreenNormal.descriptor.imageView, VK_IMAGE_LAYOUT_GENERAL };
+  VkDescriptorImageInfo linearDepthInfo{{}, m_offscreenLinearDepth.descriptor.imageView, VK_IMAGE_LAYOUT_GENERAL };
+  VkDescriptorImageInfo motionInfo{ {}, m_offscreenMotion.descriptor.imageView, VK_IMAGE_LAYOUT_GENERAL };
+  VkDescriptorImageInfo noisyInfo{ {}, m_offscreenNoisyShadow.descriptor.imageView, VK_IMAGE_LAYOUT_GENERAL };
 
   std::vector<VkWriteDescriptorSet> writes;
   writes.emplace_back(m_rtDescSetLayoutBind.makeWrite(m_rtDescSet, RtxBindings::eTlas, &descASInfo));
   writes.emplace_back(m_rtDescSetLayoutBind.makeWrite(m_rtDescSet, RtxBindings::eOutImage, &imageInfo));
+  writes.emplace_back(m_rtDescSetLayoutBind.makeWrite(m_rtDescSet, RtxBindings::eNormalImage, &normalInfo));
+  writes.emplace_back(m_rtDescSetLayoutBind.makeWrite(m_rtDescSet, RtxBindings::eLinearDepth, &linearDepthInfo));
+  writes.emplace_back(m_rtDescSetLayoutBind.makeWrite(m_rtDescSet, RtxBindings::eMotionImage, &motionInfo));
+  writes.emplace_back(m_rtDescSetLayoutBind.makeWrite(m_rtDescSet, RtxBindings::eNoisyShadow, &noisyInfo));
+
   vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
@@ -721,6 +937,22 @@ void HelloVulkan::updateRtDescriptorSet()
   VkDescriptorImageInfo imageInfo{{}, m_offscreenColor.descriptor.imageView, VK_IMAGE_LAYOUT_GENERAL};
   VkWriteDescriptorSet  wds = m_rtDescSetLayoutBind.makeWrite(m_rtDescSet, RtxBindings::eOutImage, &imageInfo);
   vkUpdateDescriptorSets(m_device, 1, &wds, 0, nullptr);
+
+  VkDescriptorImageInfo normalInfo{ {}, m_offscreenNormal.descriptor.imageView, VK_IMAGE_LAYOUT_GENERAL };
+  auto w = m_rtDescSetLayoutBind.makeWrite(m_rtDescSet, RtxBindings::eNormalImage, &normalInfo);
+  vkUpdateDescriptorSets(m_device, 1, &w, 0, nullptr);
+
+  VkDescriptorImageInfo linearDepthInfo{ {}, m_offscreenLinearDepth.descriptor.imageView, VK_IMAGE_LAYOUT_GENERAL };
+  auto l = m_rtDescSetLayoutBind.makeWrite(m_rtDescSet, RtxBindings::eLinearDepth, &linearDepthInfo);
+  vkUpdateDescriptorSets(m_device, 1, &l, 0, nullptr);
+
+  VkDescriptorImageInfo motionInfo{ {}, m_offscreenMotion.descriptor.imageView, VK_IMAGE_LAYOUT_GENERAL };
+  auto m = m_rtDescSetLayoutBind.makeWrite(m_rtDescSet, RtxBindings::eMotionImage, &motionInfo);
+  vkUpdateDescriptorSets(m_device, 1, &m, 0, nullptr);
+
+  VkDescriptorImageInfo noisyInfo{ {}, m_offscreenNoisyShadow.descriptor.imageView, VK_IMAGE_LAYOUT_GENERAL };
+  auto ns = m_rtDescSetLayoutBind.makeWrite(m_rtDescSet, RtxBindings::eNoisyShadow, &noisyInfo);
+  vkUpdateDescriptorSets(m_device, 1, &ns, 0, nullptr);
 }
 
 
@@ -908,6 +1140,17 @@ void HelloVulkan::createRtShaderBindingTable()
   m_alloc.finalizeAndReleaseStaging();
 }
 
+static inline VkImageMemoryBarrier makeRtToFsBarrier(VkImage image) {
+	VkImageMemoryBarrier ib{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+	ib.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;   // written by RT shaders
+	ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;    // to be read by FS
+	ib.oldLayout = VK_IMAGE_LAYOUT_GENERAL;      // we keep GENERAL
+	ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	ib.image = image;
+	ib.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+	return ib;
+}
+
 //--------------------------------------------------------------------------------------------------
 // Ray Tracing the scene
 //
@@ -919,6 +1162,10 @@ void HelloVulkan::raytrace(const VkCommandBuffer& cmdBuf, const glm::vec4& clear
   m_pcRay.lightPosition  = m_pcRaster.lightPosition;
   m_pcRay.lightIntensity = m_pcRaster.lightIntensity;
   m_pcRay.lightType      = m_pcRaster.lightType;
+  // rectangle light
+  m_pcRay.lightU = m_pcRaster.u;
+  m_pcRay.lightV = m_pcRaster.v;
+  m_pcRay.lightArea = m_pcRaster.area;
 
   std::vector<VkDescriptorSet> descSets{m_rtDescSet, m_descSet};
   vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtPipeline);
@@ -930,7 +1177,348 @@ void HelloVulkan::raytrace(const VkCommandBuffer& cmdBuf, const glm::vec4& clear
 
 
   vkCmdTraceRaysKHR(cmdBuf, &m_rgenRegion, &m_missRegion, &m_hitRegion, &m_callRegion, m_size.width, m_size.height, 1);
+  // Make RT writes visible to the fragment shader in the post pass
+  std::vector<VkImageMemoryBarrier> barriers;
+  barriers.push_back(makeRtToFsBarrier(m_offscreenColor.image));
+  barriers.push_back(makeRtToFsBarrier(m_offscreenNormal.image));
+  barriers.push_back(makeRtToFsBarrier(m_offscreenLinearDepth.image)); // if you created it
+  barriers.push_back(makeRtToFsBarrier(m_offscreenMotion.image)); 
+  barriers.push_back(makeRtToFsBarrier(m_offscreenNoisyShadow.image));
 
+  if (!barriers.empty()) {
+	  vkCmdPipelineBarrier(cmdBuf,
+		  VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,   // src
+		  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,          // dst
+		  0,
+		  0, nullptr, 0, nullptr,
+		  static_cast<uint32_t>(barriers.size()), barriers.data());
+  }
 
   m_debug.endLabel(cmdBuf);
+}
+
+void HelloVulkan::createTemporalDescriptor()
+{
+	m_temporalDSBind = {};
+	// sampled inputs
+	m_temporalDSBind.addBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT); // histPrev
+	m_temporalDSBind.addBinding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT); // normalPrev
+	m_temporalDSBind.addBinding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT); // depthPrev
+	m_temporalDSBind.addBinding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT); // normalCurr
+	m_temporalDSBind.addBinding(4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT); // depthCurr
+	m_temporalDSBind.addBinding(5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT); // motion
+	m_temporalDSBind.addBinding(6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT); // noisyShadow
+	// storage output
+	m_temporalDSBind.addBinding(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT); // outMoments
+
+	m_temporalDescSetLayout = m_temporalDSBind.createLayout(m_device);
+	m_temporalDescPool = m_temporalDSBind.createPool(m_device, m_framesInFlight);
+
+	m_temporalDescSets.resize(m_framesInFlight);
+	for (uint32_t i = 0; i < m_framesInFlight; ++i) {
+		m_temporalDescSets[i] = nvvk::allocateDescriptorSet(m_device, m_temporalDescPool, m_temporalDescSetLayout);
+	}
+}
+
+void HelloVulkan::createTemporalPipeline()
+{
+	// Push constants
+	struct PC { float tauZ, tauN, clampK, alphaUse; int firstFrame; };
+	VkPushConstantRange pcRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC) };
+
+	VkPipelineLayoutCreateInfo pli{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+	pli.setLayoutCount = 1;
+	pli.pSetLayouts = &m_temporalDescSetLayout;
+	pli.pushConstantRangeCount = 1;
+	pli.pPushConstantRanges = &pcRange;
+	vkCreatePipelineLayout(m_device, &pli, nullptr, &m_temporalPipeLayout);
+
+	// Compute pipeline
+	std::vector<std::string> paths = defaultSearchPaths;
+	auto spv = nvh::loadFile("spv/temporal_pass1.comp.spv", true, paths, true);
+	VkShaderModule mod = nvvk::createShaderModule(m_device, spv);
+
+	VkComputePipelineCreateInfo ci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+	ci.layout = m_temporalPipeLayout;
+	ci.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+				VK_SHADER_STAGE_COMPUTE_BIT, mod, "main", nullptr };
+
+	vkCreateComputePipelines(m_device, {}, 1, &ci, nullptr, &m_temporalPipeline);
+	vkDestroyShaderModule(m_device, mod, nullptr);
+}
+
+void HelloVulkan::updateTemporalDescriptorSet(int readIdx, int writeIdx, uint32_t frameIdx)
+{
+	VkDescriptorSet ds = m_temporalDescSets[frameIdx];
+
+	VkDescriptorImageInfo histPrev = m_histMoments[readIdx].descriptor;
+	VkDescriptorImageInfo normalPrev = m_prevNormal.descriptor;
+	VkDescriptorImageInfo depthPrev = m_prevDepth.descriptor;
+	VkDescriptorImageInfo normalCur = m_offscreenNormal.descriptor;
+	VkDescriptorImageInfo depthCur = m_offscreenLinearDepth.descriptor;
+	VkDescriptorImageInfo motion = m_offscreenMotion.descriptor;
+	VkDescriptorImageInfo noisy = m_offscreenNoisyShadow.descriptor; // your noisy shadow src
+
+	// storage target must be GENERAL
+	VkDescriptorImageInfo outMoments{ {}, m_histMoments[writeIdx].descriptor.imageView, VK_IMAGE_LAYOUT_GENERAL };
+
+	std::vector<VkWriteDescriptorSet> writes;
+	writes.emplace_back(m_temporalDSBind.makeWrite(ds, 0, &histPrev));
+	writes.emplace_back(m_temporalDSBind.makeWrite(ds, 1, &normalPrev));
+	writes.emplace_back(m_temporalDSBind.makeWrite(ds, 2, &depthPrev));
+	writes.emplace_back(m_temporalDSBind.makeWrite(ds, 3, &normalCur));
+	writes.emplace_back(m_temporalDSBind.makeWrite(ds, 4, &depthCur));
+	writes.emplace_back(m_temporalDSBind.makeWrite(ds, 5, &motion));
+	writes.emplace_back(m_temporalDSBind.makeWrite(ds, 6, &noisy));
+	writes.emplace_back(m_temporalDSBind.makeWrite(ds, 7, &outMoments));
+
+	vkUpdateDescriptorSets(m_device, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+}
+
+void HelloVulkan::runTemporalPass1(VkCommandBuffer cmd, uint32_t frameIdx)
+{
+	// Choose ping-pong indices
+	int writeIdx = m_histIdx;
+	int readIdx = 1 - m_histIdx;
+
+	// Make RT writes visible to compute (normal, depth, motion, noisy)
+	VkPipelineStageFlags src = VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+	VkPipelineStageFlags dst = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+
+	std::vector<VkImageMemoryBarrier> ib;
+	ib.push_back(makeRtToFsBarrier(m_offscreenNormal.image));
+	ib.push_back(makeRtToFsBarrier(m_offscreenLinearDepth.image));
+	ib.push_back(makeRtToFsBarrier(m_offscreenMotion.image));
+	// Add barrier for your noisy shadow image too if different from color
+	ib.push_back(makeRtToFsBarrier(m_offscreenNoisyShadow.image));
+
+	if (!ib.empty()) {
+		vkCmdPipelineBarrier(cmd, src, dst, 0, 0, nullptr, 0, nullptr,
+			(uint32_t)ib.size(), ib.data());
+	}
+
+	// Update descriptors to use readIdx as prev, writeIdx as output
+	updateTemporalDescriptorSet(readIdx, writeIdx, frameIdx);
+
+	// bind this frame's set
+	VkDescriptorSet ds = m_temporalDescSets[frameIdx];
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_temporalPipeline);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_temporalPipeLayout,
+		0, 1, &ds, 0, nullptr);
+
+	struct Params { float tauZ, tauN, clampK, alphaUse; int firstFrame; } pc;
+	pc.tauZ = 0.02f;         // tune
+	pc.tauN = 0.97f;         // tune
+	pc.clampK = 1.0f;        // tune
+	pc.alphaUse = 0.1f;      // tune
+	pc.firstFrame = m_firstFrame ? 1 : 0;
+
+	vkCmdPushConstants(cmd, m_temporalPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Params), &pc);
+
+	// Dispatch
+	const uint32_t gx = (m_size.width + 7) / 8;
+	const uint32_t gy = (m_size.height + 7) / 8;
+	vkCmdDispatch(cmd, gx, gy, 1);
+
+	// Compute -> (next consumer) barrier
+	// If next you will sample the new moments in a post FS or a spatial compute pass:
+	VkImageMemoryBarrier outBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+	outBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	outBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	outBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+	outBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	outBarrier.image = m_histMoments[writeIdx].image;
+	outBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		0, 0, nullptr, 0, nullptr, 1, &outBarrier);
+
+	// Publish current guides as "prev" for next frame
+	// (You can keep your copy code here: normal -> prevNormal, depth -> prevDepth)
+	{
+		// to copy: src must be TRANSFER_SRC, dst TRANSFER_DST
+		nvvk::cmdBarrierImageLayout(cmd, m_offscreenNormal.image,
+			VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		nvvk::cmdBarrierImageLayout(cmd, m_prevNormal.image,
+			VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+		VkImageCopy reg{};
+		reg.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		reg.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		reg.extent = { m_size.width, m_size.height, 1 };
+		vkCmdCopyImage(cmd,
+			m_offscreenNormal.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			m_prevNormal.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			1, &reg);
+
+		// restore to GENERAL for next use
+		nvvk::cmdBarrierImageLayout(cmd, m_offscreenNormal.image,
+			VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+		nvvk::cmdBarrierImageLayout(cmd, m_prevNormal.image,
+			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+	}
+
+	// Copy current linear depth -> prevDepth  (same pattern)
+	{
+		nvvk::cmdBarrierImageLayout(cmd, m_offscreenLinearDepth.image,
+			VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		nvvk::cmdBarrierImageLayout(cmd, m_prevDepth.image,
+			VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+		VkImageCopy reg{};
+		reg.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		reg.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		reg.extent = { m_size.width, m_size.height, 1 };
+		vkCmdCopyImage(cmd,
+			m_offscreenLinearDepth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			m_prevDepth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			1, &reg);
+
+		nvvk::cmdBarrierImageLayout(cmd, m_offscreenLinearDepth.image,
+			VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+		nvvk::cmdBarrierImageLayout(cmd, m_prevDepth.image,
+			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+	}
+
+	// Flip ping pong
+	m_histIdx = 1 - m_histIdx;
+	m_firstFrame = false;
+}
+
+// --- create descriptors (once) ---
+void HelloVulkan::createSpatialDescriptor()
+{
+	m_spatialDSBind = {};
+	// inputs
+	m_spatialDSBind.addBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT); // meanVar_t
+	m_spatialDSBind.addBinding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT); // normal
+	m_spatialDSBind.addBinding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT); // depth
+	// output
+	m_spatialDSBind.addBinding(3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);  // denoised
+
+	m_spatialDescSetLayout = m_spatialDSBind.createLayout(m_device);
+	m_spatialDescPool = m_spatialDSBind.createPool(m_device, m_framesInFlight);
+	m_spatialDescSets.resize(m_framesInFlight);
+	for (uint32_t i = 0; i < m_framesInFlight; ++i)
+		m_spatialDescSets[i] = nvvk::allocateDescriptorSet(m_device, m_spatialDescPool, m_spatialDescSetLayout);
+}
+
+void HelloVulkan::createSpatialPipeline()
+{
+	struct PC { float invSigmaZ, invSigmaN; float varToRadius; float varClamp; };
+	VkPushConstantRange pcRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC) };
+
+	VkPipelineLayoutCreateInfo pli{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+	pli.setLayoutCount = 1; pli.pSetLayouts = &m_spatialDescSetLayout;
+	pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcRange;
+	vkCreatePipelineLayout(m_device, &pli, nullptr, &m_spatialPipeLayout);
+
+	auto spv = nvh::loadFile("spv/spatial_pass2.comp.spv", true, defaultSearchPaths, true);
+	VkShaderModule mod = nvvk::createShaderModule(m_device, spv);
+
+	VkComputePipelineCreateInfo ci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+	ci.layout = m_spatialPipeLayout;
+	ci.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+				  VK_SHADER_STAGE_COMPUTE_BIT, mod, "main", nullptr };
+	vkCreateComputePipelines(m_device, {}, 1, &ci, nullptr, &m_spatialPipeline);
+	vkDestroyShaderModule(m_device, mod, nullptr);
+}
+
+// Per-frame descriptor update (readIdx = the index Pass1 just wrote)
+void HelloVulkan::updateSpatialDescriptorSet(int readIdx, uint32_t frameIdx)
+{
+	VkDescriptorSet ds = m_spatialDescSets[frameIdx];
+
+	VkDescriptorImageInfo meanVar = m_histMoments[readIdx].descriptor;              // R16G16 -> (mean,var)
+	VkDescriptorImageInfo normal = m_offscreenNormal.descriptor;
+	VkDescriptorImageInfo depth = m_offscreenLinearDepth.descriptor;
+
+	// output: choose/create an image for denoised shadows (e.g., VK_FORMAT_R16_SFLOAT)
+	VkDescriptorImageInfo outDenoised{ {}, m_denoisedShadow.descriptor.imageView, VK_IMAGE_LAYOUT_GENERAL };
+
+	std::vector<VkWriteDescriptorSet> writes;
+	writes.emplace_back(m_spatialDSBind.makeWrite(ds, 0, &meanVar));
+	writes.emplace_back(m_spatialDSBind.makeWrite(ds, 1, &normal));
+	writes.emplace_back(m_spatialDSBind.makeWrite(ds, 2, &depth));
+	writes.emplace_back(m_spatialDSBind.makeWrite(ds, 3, &outDenoised));
+	vkUpdateDescriptorSets(m_device, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+}
+
+void HelloVulkan::runSpatialPass2(VkCommandBuffer cmd, int readIdx, uint32_t frameIdx)
+{
+	// Make sure Pass 1 writes are visible to this compute
+	VkImageMemoryBarrier ib{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+	ib.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; // Pass1 wrote mean/var
+	ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;  // Pass2 reads it
+	ib.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+	ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	ib.image = m_histMoments[readIdx].image;
+	ib.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+	vkCmdPipelineBarrier(cmd,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,         // src = Pass1 compute
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,         // dst = this compute
+		0, 0, nullptr, 0, nullptr, 1, &ib);
+
+	updateSpatialDescriptorSet(readIdx, frameIdx);
+
+	VkDescriptorSet ds = m_spatialDescSets[frameIdx];
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_spatialPipeline);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_spatialPipeLayout, 0, 1, &ds, 0, nullptr);
+
+	struct PC { float invSigmaZ, invSigmaN; float varToRadius; float varClamp; } pc;
+	// Tunables (start here, tweak in UI later)
+	//pc.invSigmaZ = 60.0f;  // stronger depth stop with larger value
+	//pc.invSigmaN = 32.0f;  // strong normal stop (cos^32)
+	//pc.varToRadius = 8.0f;   // map variance -> radius (0..~5)
+	//pc.varClamp = 0.25f;  // optional clamp on max variance influence
+
+	pc.invSigmaZ = m_spatialPC.invSigmaZ;
+	pc.invSigmaN = m_spatialPC.invSigmaN;
+	pc.varToRadius = m_spatialPC.varToRadius;
+	pc.varClamp = m_spatialPC.varClamp;
+
+
+	vkCmdPushConstants(cmd, m_spatialPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+	const uint32_t lx = 8, ly = 8;
+	const uint32_t gx = (m_size.width + lx - 1) / lx;
+	const uint32_t gy = (m_size.height + ly - 1) / ly;
+	vkCmdDispatch(cmd, gx, gy, 1);
+
+	// If you will sample m_denoisedShadow in your post pass, add a barrier:
+	VkImageMemoryBarrier outB{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+	outB.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	outB.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	outB.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+	outB.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	outB.image = m_denoisedShadow.image;
+	outB.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 };
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		0, 0, nullptr, 0, nullptr, 1, &outB);
+}
+
+
+
+void HelloVulkan::onKeyboard(int key, int /*scancode*/, int action, int /*mods*/)
+{
+	if (action == GLFW_PRESS || action == GLFW_REPEAT)
+	{
+		float moveStep = 10000.0f;  // higher = faster movement
+		switch (key)
+		{
+		case GLFW_KEY_W:
+			CameraManip.keyMotion(0.0f, moveStep, 1);  // dolly forward
+			break;
+		case GLFW_KEY_S:
+			CameraManip.keyMotion(0.0f, -moveStep, 1); // dolly backward
+			break;
+		case GLFW_KEY_A:
+			CameraManip.keyMotion(-moveStep, 0.0f, 2); // pan left
+			break;
+		case GLFW_KEY_D:
+			CameraManip.keyMotion(moveStep, 0.0f, 2);  // pan right
+			break;
+		}
+	}
 }

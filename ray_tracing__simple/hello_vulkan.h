@@ -51,6 +51,7 @@ public:
   void onResize(int /*w*/, int /*h*/) override;
   void destroyResources();
   void rasterize(const VkCommandBuffer& cmdBuff);
+  void onKeyboard(int key, int /*scancode*/, int action, int /*mods*/);
 
   // The OBJ model
   struct ObjModel
@@ -69,6 +70,14 @@ public:
     uint32_t  objIndex{0};  // Model index reference
   };
 
+  // push constant for post draw
+  struct PostPC 
+  { 
+    float aspect; 
+    int mode; // 0 color, 1 normal, 2 depth
+  };
+
+  PostPC m_postPC{};
 
   // Information pushed at each draw call
   PushConstantRaster m_pcRaster{
@@ -76,7 +85,10 @@ public:
       {10.f, 15.f, 8.f},                                 // light position
       0,                                                 // instance Id
       100.f,                                             // light intensity
-      0                                                  // light type
+      2,                                                  // light type
+	  { 5.f, 0, 0, 0 }, // u vector
+      { 0, 0, 5.f, 0 }, // v vector
+	  25 // area
   };
 
   // Array of objects and instances in the scene
@@ -118,10 +130,59 @@ public:
   VkPipelineLayout            m_postPipelineLayout{VK_NULL_HANDLE};
   VkRenderPass                m_offscreenRenderPass{VK_NULL_HANDLE};
   VkFramebuffer               m_offscreenFramebuffer{VK_NULL_HANDLE};
-  nvvk::Texture               m_offscreenColor;
-  nvvk::Texture               m_offscreenDepth;
+  nvvk::Texture               m_offscreenColor{};
+  nvvk::Texture               m_offscreenDepth{};
+  nvvk::Texture               m_offscreenNormal{};
+  nvvk::Texture               m_offscreenLinearDepth{};
+  nvvk::Texture               m_offscreenMotion{};
+  nvvk::Texture               m_offscreenNoisyShadow;   // R16F noisy visibility (0..1)
+
+  VkFormat                    m_offscreenNoisyShadowFormat{ VK_FORMAT_R16_SFLOAT };
   VkFormat                    m_offscreenColorFormat{VK_FORMAT_R32G32B32A32_SFLOAT};
   VkFormat                    m_offscreenDepthFormat{VK_FORMAT_X8_D24_UNORM_PACK32};
+  VkFormat                    m_offscreenNormalFormat{VK_FORMAT_R16G16B16A16_SFLOAT};
+  VkFormat                    m_offscreenLinearDepthFormat{ VK_FORMAT_R32_SFLOAT };
+  VkFormat                    m_offscreenMotionFormat{ VK_FORMAT_R16G16_SFLOAT };
+
+  // Temporal Pass 1
+  nvvk::Texture m_histMoments[2];           // ping-pong (R=mean, G=m2)
+  int           m_histIdx = 0;              // which one is “current write”
+  nvvk::Texture m_prevNormal;               // prev frame normal
+  nvvk::Texture m_prevDepth;                // prev frame linear depth
+
+  std::vector<VkDescriptorSet> m_temporalDescSets;
+  VkPipelineLayout              m_temporalPipeLayout{};
+  VkPipeline                    m_temporalPipeline{};
+  nvvk::DescriptorSetBindings   m_temporalDSBind;
+  VkDescriptorSetLayout         m_temporalDescSetLayout{};
+  VkDescriptorPool              m_temporalDescPool{};
+  VkDescriptorSet               m_temporalDescSet{};
+
+  // how many frames you pipeline; usually your swapchain image count
+  uint32_t m_framesInFlight = 2;  // set at init from swapchain
+
+  void createTemporalDescriptor();
+  void createTemporalPipeline();
+  void updateTemporalDescriptorSet(int readIdx, int writeIdx, uint32_t frameIdx);
+  void runTemporalPass1(VkCommandBuffer cmd, uint32_t frameIdx);
+
+  // Pass 2
+  // Spatial pass 2 outputs
+  nvvk::Texture m_denoisedShadow;
+
+  // Spatial (variance-guided bilateral filter)
+  nvvk::DescriptorSetBindings m_spatialDSBind;
+  VkDescriptorSetLayout       m_spatialDescSetLayout{ VK_NULL_HANDLE };
+  VkDescriptorPool            m_spatialDescPool{ VK_NULL_HANDLE };
+  std::vector<VkDescriptorSet> m_spatialDescSets;   // per-frame DS
+  VkPipelineLayout            m_spatialPipeLayout{ VK_NULL_HANDLE };
+  VkPipeline                  m_spatialPipeline{ VK_NULL_HANDLE };
+
+  // Pass 2 (spatial bilateral filter)
+  void createSpatialDescriptor();
+  void createSpatialPipeline();
+  void updateSpatialDescriptorSet(int readIdx, uint32_t frameIdx);
+  void runSpatialPass2(VkCommandBuffer cmd, int readIdx, uint32_t frameIdx);
 
   // #VKRay
   void initRayTracing();
@@ -153,4 +214,24 @@ public:
 
   // Push constant for ray tracer
   PushConstantRay m_pcRay{};
+
+  // Camera reprojection state (for motion vectors / temporal denoise)
+  mat4 m_prevV{ 1.0f };
+  mat4 m_prevP{ 1.0f };
+  mat4 m_prevVP{ 1.0f };
+  mat4 m_currV{ 1.0f };
+  mat4 m_currP{ 1.0f };
+  mat4 m_currVP{ 1.0f };
+  bool m_firstFrame = true;
+
+  // Denoiser params
+  struct SpatialParams {
+	  float invSigmaZ = 60.0f;
+	  float invSigmaN = 32.0f;
+	  float varToRadius = 8.0f;
+	  float varClamp = 0.25f;
+  };
+
+  SpatialParams m_spatialPC;
+
 };

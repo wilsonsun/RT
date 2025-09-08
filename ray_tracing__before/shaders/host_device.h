@@ -79,16 +79,29 @@ struct PushConstantRaster
   uint  objIndex;
   float lightIntensity;
   int   lightType;
+  // Rectangle Lights
+  vec4  u;              // U vector of rectangle
+  vec4  v;              // V vector of rectangle
+  float area;           // Area of rectangle
+  vec3  _pad1;          // 12 bytes (pad to 16-byte multiple)
 };
 
 
 // Push constant structure for the ray tracer
 struct PushConstantRay
 {
-  vec4  clearColor;
-  vec3  lightPosition;
-  float lightIntensity;
-  int   lightType;
+	vec4  clearColor;      // 16 bytes (offset 0)
+
+	vec3  lightPosition;   // 12 bytes (offset 16)
+	float lightIntensity;  // 4 bytes (offset 28) completes 16 bytes block
+
+	int   lightType;       // 4 bytes (offset 32)
+	float lightArea;       // 4 bytes (offset 36)
+	// Add 8 bytes padding here to align next vec4 to 16 bytes
+	int   _pad1[2];        // 8 bytes padding (offset 40)
+
+	vec4  lightU;          // 16 bytes (offset 48)
+	vec4  lightV;          // 16 bytes (offset 64)
 };
 
 struct Vertex  // See ObjLoader, copy of VertexObj, could be compressed for device

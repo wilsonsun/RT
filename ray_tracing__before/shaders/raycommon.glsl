@@ -17,22 +17,45 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#version 460
-#extension GL_EXT_ray_tracing : require
-#extension GL_GOOGLE_include_directive : enable
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-
-#include "raycommon.glsl"
-#include "wavefront.glsl"
-
-layout(location = 0) rayPayloadInEXT hitPayload prd;
-
-layout(push_constant) uniform _PushConstantRay
+struct hitPayload
 {
-  PushConstantRay pcRay;
+  vec3 hitValue;
+  uint seed;
+  int  depth;
+  vec3 attenuation;
+  int  done;
+  vec3 rayOrigin;
+  vec3 rayDir;
 };
 
-void main()
+
+struct rayLight
 {
-  prd.hitValue = pcRay.clearColor.xyz * 0.7;
-}
+  vec3  inHitPosition;
+  float outLightDistance;
+  vec3  outLightDir;
+  float outIntensity;
+};
+
+struct Implicit
+{
+  vec3 minimum;
+  vec3 maximum;
+  int  objType;
+  int  matId;
+};
+
+struct Sphere
+{
+  vec3  center;
+  float radius;
+};
+
+struct Aabb
+{
+  vec3 minimum;
+  vec3 maximum;
+};
+
+#define KIND_SPHERE 0
+#define KIND_CUBE 1
