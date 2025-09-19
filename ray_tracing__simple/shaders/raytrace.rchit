@@ -49,6 +49,58 @@ float rand(inout uint seed) {
   return float(seed) * (1.0 / 4294967296.0);
 }
 
+// ---- integer hash (wang) ----------------------------------------------------
+uint wang_hash(uint x)
+{
+    x = (x ^ 61u) ^ (x >> 16);
+    x *= 9u;
+    x ^= (x >> 4);
+    x *= 0x27d4eb2du;
+    x ^= (x >> 15);
+    return x;
+}
+
+// ---- 32-bit to float in [0,1) ------------------------------------------------
+float u32_to_float01(uint v)
+{
+    // divide by 2^32 as float
+    return float(v) * (1.0 / 4294967296.0);
+}
+
+// ---- small xorshift-like step to advance rng state ---------------------------
+uint rng_step(inout uint state)
+{
+    // A few ops to scramble state (cheap PRNG)
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    // mix with a constant
+    state *= 0x9E3779B1u;
+    state = wang_hash(state);
+    return state;
+}
+
+// ---- convenience: per-pixel+per-frame random in [0,1) ------------------------
+float randPixelFrame(ivec2 pixel, uint frame)
+{
+    // build a 32-bit seed from pixel coords and frame
+    // combine coordinates in a way that reduces collisions
+    uint seed = uint(pixel.x) + (uint(pixel.y) * 73856093u);    // pack pixel loc
+    seed ^= (frame + 0x9e3779b9u);                             // xor with frame
+    seed = wang_hash(seed);                                    // scramble
+    // advance a couple times for decorrelation
+    rng_step(seed);
+    rng_step(seed);
+    return u32_to_float01(seed);
+}
+
+// ---- alternate: seeded rand using existing surfKey/seed approach -------------
+float randFromSeed(inout uint seed)
+{
+    uint v = rng_step(seed);
+    return u32_to_float01(v);
+}
+
 // Shadow query wrapper. Returns true if any occluder is found.
 bool traceShadowAnyHit(vec3 origin, vec3 dir, float tMax) {
   const uint flags =
@@ -188,6 +240,17 @@ void main() {
       vec2 u = vec2(fract(rand(P.xy + vec2(float(i), 0.0))),
                     fract(rand(P.yz + vec2(0.0, float(i)))));
 
+      // get pixel coords inside closest-hit: gl_LaunchIDEXT.xy
+      //ivec2 px = ivec2(gl_LaunchIDEXT.xy);
+      //
+      //// if you have frame index in Uniforms (see below), use it:
+      //uint frame = uint(uni.frameIndex); // add this field (see note)
+      //
+      //// produce 1 (or many) random samples
+      //vec2 u;
+      //u.x = randPixelFrame(px, frame);
+      //u.y = randPixelFrame(px + ivec2(17, 29), frame); // offset to decorrelate components
+      
       vec3 Ls, lightPt;
       float d, cosThetaL;
       sampleRectLight(P, u, Ls, d, cosThetaL, lightPt);

@@ -28,6 +28,7 @@ layout(set = 0, binding = 2) uniform sampler2D uDepth;     // linear depth (r32f
 layout(set = 0, binding = 3) uniform sampler2D uMotion;
 layout(set = 0, binding = 4) uniform sampler2D uNoisyShadow;   
 layout(set = 0, binding = 5) uniform sampler2D uDenoisedShadow;
+layout(set = 0, binding = 6) uniform sampler2D uPass1Debug;
 
 layout(push_constant) uniform PC {
   float aspect;
@@ -63,6 +64,7 @@ void main()
   }
 
   if (pc.mode == 3) {
+  /*
     vec2 motion = texelFetch(uMotion, ivec2(gl_FragCoord.xy), 0).rg;
 
     // Hardcoded scale
@@ -71,6 +73,13 @@ void main()
 
     // Visualize X in red, Y in green
     fragColor = vec4(m, 0.0, 1.0);
+    */
+    vec2 v = texelFetch(uMotion, ivec2(gl_FragCoord.xy), 0).xy; // pixels
+    float S = 32.0;                    // scale
+    vec2 n = clamp(v / S, -1.0, 1.0);  // normalize for display
+    // map [-1,1] to [0,1]
+    fragColor = vec4(0.5 + 0.5*n.x, 0.5 + 0.5*n.y, 0.0, 1.0);
+
     return;
    }
 
@@ -85,6 +94,12 @@ void main()
     fragColor = vec4(vis, vis, vis, 1.0);
     return;
   }
+
+  if (pc.mode == 6) { // choose any number not used yet
+    fragColor = texture(uPass1Debug, outUV);
+    //fragColor = vec4(1.0, 0.0, 1.0, 1.0); // magenta for now
+    return;
+}
 
   // Default: show color with gamma (linear -> display)
   vec4 col = texture(noisyTxt, outUV);

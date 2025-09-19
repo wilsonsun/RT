@@ -135,7 +135,8 @@ public:
   nvvk::Texture               m_offscreenNormal{};
   nvvk::Texture               m_offscreenLinearDepth{};
   nvvk::Texture               m_offscreenMotion{};
-  nvvk::Texture               m_offscreenNoisyShadow;   // R16F noisy visibility (0..1)
+  nvvk::Texture               m_offscreenNoisyShadow{};  // R16F noisy visibility (0..1)
+  nvvk::Texture               m_offscreenPass1Debug{};
 
   VkFormat                    m_offscreenNoisyShadowFormat{ VK_FORMAT_R16_SFLOAT };
   VkFormat                    m_offscreenColorFormat{VK_FORMAT_R32G32B32A32_SFLOAT};
@@ -234,4 +235,12 @@ public:
 
   SpatialParams m_spatialPC;
 
+  struct Params
+  {
+    float tauZ, tauN, clampK, alphaUse;
+    int   firstFrame;
+    int   debugMode; // 0=off, 1=reuse mask, 2=varPrev, 3=spatialVar, 4=band, 5=dz/nz, 6=alpha, 7=curr/meanPrev/meanT
+  };
+
+  Params m_temporalPC{0.02f, 0.97f, 1.0f, 0.1f, 1, 1};
 };

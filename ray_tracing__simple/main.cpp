@@ -95,6 +95,8 @@ void renderUI(HelloVulkan& helloVk)
     ImGui::SameLine();
 	ImGui::RadioButton("Denoised shadow", &helloVk.m_postPC.mode, 5); 
 
+    ImGui::RadioButton("Pass 1 debug", &helloVk.m_postPC.mode, 6); 
+
     ImGui::SliderFloat3("Position", &helloVk.m_pcRaster.lightPosition.x, -20.f, 20.f);
     ImGui::SliderFloat("Intensity", &helloVk.m_pcRaster.lightIntensity, 0.f, 150.f);
   }
@@ -124,6 +126,24 @@ void renderUI(HelloVulkan& helloVk)
 	  ImGui::SliderFloat("Inv Sigma N", &helloVk.m_spatialPC.invSigmaN, 1.0f, 128.0f, "%.1f");
 	  ImGui::SliderFloat("Var -> Radius", &helloVk.m_spatialPC.varToRadius, 0.0f, 20.0f, "%.2f");
 	  ImGui::SliderFloat("Var Clamp", &helloVk.m_spatialPC.varClamp, 0.0f, 1.0f, "%.2f");
+
+      ImGui::Separator();
+
+        // Temporal (Pass 1)
+      ImGui::TextUnformatted("Temporal (Pass 1)");
+      // depth tolerance (use log slider because it spans small values nicely)
+      ImGui::SliderFloat("tauZ (depth tol)", &helloVk.m_temporalPC.tauZ, 1e-4f, 0.1f, "%.5f", ImGuiSliderFlags_Logarithmic);
+      // normal tolerance (cosine threshold)
+      ImGui::SliderFloat("tauN (dot N·N min)", &helloVk.m_temporalPC.tauN, 0.0f, 1.0f, "%.3f");
+      // history clamp multiplier
+      ImGui::SliderFloat("Clamp K", &helloVk.m_temporalPC.clampK, 0.0f, 3.0f, "%.2f");
+      // exponential moving average factor
+      ImGui::SliderFloat("Alpha (EMA)", &helloVk.m_temporalPC.alphaUse, 0.0f, 1.0f, "%.3f");
+      
+      // Debug view
+      static const char* kDbg[] = {"Off",        "Reuse mask", "Var(prev)",  "Spatial var",
+                                   "Clamp band", "dz/nz",      "Alpha used", "curr/meanPrev/meanT"};
+      ImGui::Combo("Debug", &helloVk.m_temporalPC.debugMode, kDbg, IM_ARRAYSIZE(kDbg));
   }
 
 }

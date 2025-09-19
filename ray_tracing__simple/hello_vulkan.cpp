@@ -58,7 +58,7 @@ void HelloVulkan::updateUniformBuffer(const VkCommandBuffer& cmdBuf)
 {
   CameraManip.updateAnim();
   CameraManip.setAnimationDuration(0.0);  // makes it instant
-  CameraManip.setSpeed(100.0f);            // try 50 or higher
+  CameraManip.setSpeed(2000.0f);            // try 50 or higher
 
   // Prepare new UBO contents on host.
   const float    aspectRatio = m_size.width / static_cast<float>(m_size.height);
@@ -89,6 +89,7 @@ void HelloVulkan::updateUniformBuffer(const VkCommandBuffer& cmdBuf)
   hostUBO.viewInverse = glm::inverse(view);
   hostUBO.projInverse = glm::inverse(proj);
   hostUBO.viewportSize = glm::vec2(float(m_size.width), float(m_size.height));
+  hostUBO.frameIndex   = getCurFrame();
 
   // UBO on the device, and what stages access it.
   VkBuffer deviceUBO      = m_bGlobals.buffer;
@@ -411,6 +412,7 @@ void HelloVulkan::destroyResources()
   m_alloc.destroy(m_offscreenDepth);
   m_alloc.destroy(m_offscreenLinearDepth);
   m_alloc.destroy(m_offscreenMotion);
+  m_alloc.destroy(m_offscreenPass1Debug);
   m_alloc.destroy(m_prevNormal);
   m_alloc.destroy(m_prevDepth);
   m_alloc.destroy(m_denoisedShadow);
@@ -497,6 +499,7 @@ void HelloVulkan::createOffscreenRender()
     m_alloc.destroy(m_offscreenMotion);
 	m_alloc.destroy(m_prevNormal);
 	m_alloc.destroy(m_prevDepth);
+	m_alloc.destroy(m_offscreenPass1Debug);
 
 	// if you created history images
 	for (int i = 0; i < 2; i++)
@@ -636,6 +639,23 @@ void HelloVulkan::createOffscreenRender()
 
 
    }
+   // Debug texture for Pass1
+   {
+     auto ci = nvvk::makeImage2DCreateInfo(m_size, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+
+     nvvk::Image           img = m_alloc.createImage(ci);
+     VkImageViewCreateInfo iv  = nvvk::makeImageViewCreateInfo(img.image, ci);
+     VkSamplerCreateInfo   sp{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+     m_offscreenPass1Debug = m_alloc.createTexture(img, iv, sp);
+     m_offscreenPass1Debug.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+     // init layout
+     nvvk::CommandPool gen(m_device, m_graphicsQueueIndex);
+     auto              cmd = gen.createCommandBuffer();
+     nvvk::cmdBarrierImageLayout(cmd, m_offscreenPass1Debug.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+     gen.submitAndWait(cmd);
+   }
+
 
   // Setting the image layout for both color and depth
   {
@@ -726,6 +746,7 @@ void HelloVulkan::createPostDescriptor()
   m_postDescSetLayoutBind.addBinding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT); // motion
   m_postDescSetLayoutBind.addBinding(4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT); // noisy shadow  <-- NEW
   m_postDescSetLayoutBind.addBinding(5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT); // denoised     <-- NEW
+  m_postDescSetLayoutBind.addBinding(6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT);  // pass1 debug
 
   m_postDescSetLayout = m_postDescSetLayoutBind.createLayout(m_device);
   m_postDescPool      = m_postDescSetLayoutBind.createPool(m_device);
@@ -738,15 +759,17 @@ void HelloVulkan::createPostDescriptor()
 //
 void HelloVulkan::updatePostDescriptorSet()
 {
-  VkWriteDescriptorSet writes[6] = {
+  VkWriteDescriptorSet writes[7] = {
     m_postDescSetLayoutBind.makeWrite(m_postDescSet, 0, &m_offscreenColor.descriptor),
     m_postDescSetLayoutBind.makeWrite(m_postDescSet, 1, &m_offscreenNormal.descriptor),
     m_postDescSetLayoutBind.makeWrite(m_postDescSet, 2, &m_offscreenLinearDepth.descriptor),
     m_postDescSetLayoutBind.makeWrite(m_postDescSet, 3, &m_offscreenMotion.descriptor),
 	m_postDescSetLayoutBind.makeWrite(m_postDescSet, 4, &m_offscreenNoisyShadow.descriptor), // NEW
-    m_postDescSetLayoutBind.makeWrite(m_postDescSet, 5, &m_denoisedShadow.descriptor)        // NEW (optional)
+    m_postDescSetLayoutBind.makeWrite(m_postDescSet, 5, &m_denoisedShadow.descriptor),       // NEW (optional)
+    m_postDescSetLayoutBind.makeWrite(m_postDescSet, 6, &m_offscreenPass1Debug.descriptor)
   };
-  vkUpdateDescriptorSets(m_device, 6, writes, 0, nullptr);
+
+  vkUpdateDescriptorSets(m_device, 7, writes, 0, nullptr);
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1210,6 +1233,8 @@ void HelloVulkan::createTemporalDescriptor()
 	m_temporalDSBind.addBinding(6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT); // noisyShadow
 	// storage output
 	m_temporalDSBind.addBinding(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT); // outMoments
+	// when creating temporal descriptor layout:
+	m_temporalDSBind.addBinding(8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);  // debug out
 
 	m_temporalDescSetLayout = m_temporalDSBind.createLayout(m_device);
 	m_temporalDescPool = m_temporalDSBind.createPool(m_device, m_framesInFlight);
@@ -1223,8 +1248,8 @@ void HelloVulkan::createTemporalDescriptor()
 void HelloVulkan::createTemporalPipeline()
 {
 	// Push constants
-	struct PC { float tauZ, tauN, clampK, alphaUse; int firstFrame; };
-	VkPushConstantRange pcRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC) };
+	//struct PC { float tauZ, tauN, clampK, alphaUse; int firstFrame; };
+	VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(m_temporalPC)};
 
 	VkPipelineLayoutCreateInfo pli{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
 	pli.setLayoutCount = 1;
@@ -1258,9 +1283,10 @@ void HelloVulkan::updateTemporalDescriptorSet(int readIdx, int writeIdx, uint32_
 	VkDescriptorImageInfo depthCur = m_offscreenLinearDepth.descriptor;
 	VkDescriptorImageInfo motion = m_offscreenMotion.descriptor;
 	VkDescriptorImageInfo noisy = m_offscreenNoisyShadow.descriptor; // your noisy shadow src
-
+	
 	// storage target must be GENERAL
 	VkDescriptorImageInfo outMoments{ {}, m_histMoments[writeIdx].descriptor.imageView, VK_IMAGE_LAYOUT_GENERAL };
+	VkDescriptorImageInfo dbg{{}, m_offscreenPass1Debug.descriptor.imageView, VK_IMAGE_LAYOUT_GENERAL};
 
 	std::vector<VkWriteDescriptorSet> writes;
 	writes.emplace_back(m_temporalDSBind.makeWrite(ds, 0, &histPrev));
@@ -1271,6 +1297,7 @@ void HelloVulkan::updateTemporalDescriptorSet(int readIdx, int writeIdx, uint32_
 	writes.emplace_back(m_temporalDSBind.makeWrite(ds, 5, &motion));
 	writes.emplace_back(m_temporalDSBind.makeWrite(ds, 6, &noisy));
 	writes.emplace_back(m_temporalDSBind.makeWrite(ds, 7, &outMoments));
+	writes.emplace_back(m_temporalDSBind.makeWrite(ds, 8, &dbg));
 
 	vkUpdateDescriptorSets(m_device, (uint32_t)writes.size(), writes.data(), 0, nullptr);
 }
@@ -1306,14 +1333,9 @@ void HelloVulkan::runTemporalPass1(VkCommandBuffer cmd, uint32_t frameIdx)
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_temporalPipeLayout,
 		0, 1, &ds, 0, nullptr);
 
-	struct Params { float tauZ, tauN, clampK, alphaUse; int firstFrame; } pc;
-	pc.tauZ = 0.02f;         // tune
-	pc.tauN = 0.97f;         // tune
-	pc.clampK = 1.0f;        // tune
-	pc.alphaUse = 0.1f;      // tune
-	pc.firstFrame = m_firstFrame ? 1 : 0;
+	m_temporalPC.firstFrame = m_firstFrame ? 1 : 0;
 
-	vkCmdPushConstants(cmd, m_temporalPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Params), &pc);
+	vkCmdPushConstants(cmd, m_temporalPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Params), &m_temporalPC);
 
 	// Dispatch
 	const uint32_t gx = (m_size.width + 7) / 8;
@@ -1332,6 +1354,19 @@ void HelloVulkan::runTemporalPass1(VkCommandBuffer cmd, uint32_t frameIdx)
 	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		0, 0, nullptr, 0, nullptr, 1, &outBarrier);
+
+	// after vkCmdDispatch for pass1
+	VkImageMemoryBarrier dbgB{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+	dbgB.srcAccessMask    = VK_ACCESS_SHADER_WRITE_BIT;
+	dbgB.dstAccessMask    = VK_ACCESS_SHADER_READ_BIT;
+	dbgB.oldLayout        = VK_IMAGE_LAYOUT_GENERAL;
+	dbgB.newLayout        = VK_IMAGE_LAYOUT_GENERAL;
+	dbgB.image            = m_offscreenPass1Debug.image;
+	dbgB.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+						   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+						   nullptr, 1, &dbgB);
+
 
 	// Publish current guides as "prev" for next frame
 	// (You can keep your copy code here: normal -> prevNormal, depth -> prevDepth)

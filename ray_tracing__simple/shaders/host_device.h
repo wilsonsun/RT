@@ -80,7 +80,8 @@ struct GlobalUniforms
   mat4 projInverse;  // Camera inverse projection matrix
 
   vec2 viewportSize;  // (w, h) in pixels
-  vec2 _pad;          // keep 16B alignment
+  int frameIndex;    // NEW
+  int  _pad0;         // padding
 };
 
 // Push constant structure for the raster
